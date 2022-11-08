@@ -16,6 +16,11 @@
 import tensorflow as tf
 import argparse
 import numpy as np
+import os
+
+# This limits the amount of memory used:
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+os.environ["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=2"
 
 import time
 t0 = time.time()
@@ -27,22 +32,32 @@ parser.add_argument('--epochs', type=int, default=16, metavar='N',
 parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                     help='learning rate (default: 0.01)')
 parser.add_argument('--device', default='gpu',
-                    help='Wheter this is running on cpu or gpu')
+                    help='Whether this is running on cpu or gpu')
 parser.add_argument('--num_inter', default=2, help='set number inter', type=int)
 parser.add_argument('--num_intra', default=0, help='set number intra', type=int)
 
 args = parser.parse_args()
 
+# This control parallelism in Tensorflow
+parallel_threads = 128
+
+# This controls how many batches to prefetch
+prefetch_buffer_size = 8 # tf.data.AUTOTUNE
+
+# HVD-1 - initialize Horovd
+import horovod.tensorflow as hvd
+hvd.init()
+print("# I am rank %d of %d" %(hvd.rank(), hvd.size()))
+parallel_threads = parallel_threads//hvd.size()
+os.environ['OMP_NUM_THREADS'] = str(parallel_threads)
+num_parallel_readers = parallel_threads
 
 if args.device == 'cpu':
     tf.config.threading.set_intra_op_parallelism_threads(args.num_intra)
     tf.config.threading.set_inter_op_parallelism_threads(args.num_inter)
 else:
     gpus = tf.config.experimental.list_physical_devices('GPU')
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-
-
+    tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
 
 #---------------------------------------------------
 # Dataset
@@ -98,6 +113,8 @@ def training_step(images, labels):
         equality = tf.math.equal(pred, labels)
         accuracy = tf.math.reduce_mean(tf.cast(equality, tf.float32))
 
+    # HVD-4 wrap the gradient tape
+    tape = hvd.DistributedGradientTape(tape)
     grads = tape.gradient(loss_value, mnist_model.trainable_variables)
     opt.apply_gradients(zip(grads, mnist_model.trainable_variables))
     return loss_value, accuracy
@@ -127,9 +144,14 @@ for ep in range(args.epochs):
     tt0 = time.time()
     for batch, (images, labels) in enumerate(dataset.take(nstep)):
         loss_value, acc = training_step(images, labels)
+        
+        # average metrics
+        loss_value = hvd.allreduce(loss_value, average=True)
+        acc = hvd.allreduce(acc, average=True)
+        
         training_loss += loss_value/nstep
         training_acc += acc/nstep
-        if batch % 100 == 0: 
+        if batch % 100 == 0 and hvd.rank()==0: 
             checkpoint.save(checkpoint_dir)
             print('Epoch - %d, step #%06d/%06d\tLoss: %.6f' % (ep, batch, nstep, loss_value))
     # Testing
@@ -137,6 +159,11 @@ for ep in range(args.epochs):
     test_loss = 0.0
     for batch, (images, labels) in enumerate(test_dset.take(ntest_step)):
         loss_value, acc = validation_step(images, labels)
+        
+        # HVD-8 average the metrics
+        acc = hvd.allreduce(acc, average=True)
+        loss_value = hvd.allreduce(loss_value, average=True)
+        
         test_acc += acc/ntest_step
         test_loss += loss_value/ntest_step
     tt1 = time.time()
@@ -146,7 +173,18 @@ for ep in range(args.epochs):
     metrics['valid_acc'].append(test_acc.numpy())
     metrics['valid_loss'].append(test_loss.numpy())
     metrics['time_per_epochs'].append(tt1 - tt0) 
-checkpoint.save(checkpoint_dir)
+    
+if (hvd.rank()==0):
+    checkpoint.save(checkpoint_dir)
+
 np.savetxt("metrics.dat", np.array([metrics['train_acc'], metrics['train_loss'], metrics['valid_acc'], metrics['valid_loss'], metrics['time_per_epochs']]).transpose())
 t1 = time.time()
 print("Total training time: %s seconds" %(t1 - t0))
+
+import matplotlib.pyplot as plt
+plt.plot(np.arange(len(metrics['valid_acc'])), metrics['valid_acc'], label="Validation")
+plt.plot(np.arange(len(metrics['train_acc'])), metrics['train_acc'], label="Training")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.savefig(f"accuracy_{hvd.size()}.pdf")
